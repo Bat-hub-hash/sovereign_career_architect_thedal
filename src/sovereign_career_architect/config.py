@@ -57,10 +57,24 @@ class Settings(BaseSettings):
     host: str = Field("0.0.0.0", description="Server host")
     port: int = Field(8000, description="Server port")
     reload: bool = Field(False, description="Enable auto-reload")
+    api_host: str = Field("0.0.0.0", description="API server host")
+    api_port: int = Field(8000, description="API server port")
+    allowed_origins: list[str] = Field(["*"], description="CORS allowed origins")
+    allowed_hosts: Optional[list[str]] = Field(None, description="Trusted hosts")
     
     # Security
     cors_origins: list[str] = Field(["*"], description="CORS allowed origins")
     api_key_header: str = Field("X-API-Key", description="API key header name")
+    jwt_secret_key: str = Field("your-secret-key-change-in-production", description="JWT secret key")
+    jwt_algorithm: str = Field("HS256", description="JWT algorithm")
+    jwt_expiration_hours: int = Field(24, description="JWT expiration hours")
+    
+    # Browser Configuration (additional)
+    browser_stealth_mode: bool = Field(True, description="Enable browser stealth mode")
+    browser_user_data_dir: Optional[str] = Field(None, description="Browser user data directory")
+    
+    # Voice Configuration (additional)
+    vapi_webhook_secret: Optional[str] = Field(None, description="Vapi.ai webhook secret")
 
 
 # Global settings instance

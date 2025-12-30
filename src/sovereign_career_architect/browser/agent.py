@@ -7,6 +7,7 @@ import structlog
 
 from sovereign_career_architect.config import settings
 from sovereign_career_architect.utils.logging import get_logger
+from sovereign_career_architect.browser.stealth import StealthManager, StealthConfig
 
 logger = get_logger(__name__)
 
@@ -24,7 +25,8 @@ class BrowserAgent:
         headless: bool = True,
         stealth_mode: bool = True,
         user_data_dir: Optional[str] = None,
-        viewport_size: tuple = (1920, 1080)
+        viewport_size: tuple = (1920, 1080),
+        stealth_config: Optional[StealthConfig] = None
     ):
         """
         Initialize the browser agent.
@@ -34,6 +36,7 @@ class BrowserAgent:
             stealth_mode: Enable stealth mode to avoid bot detection
             user_data_dir: Custom user data directory for persistent sessions
             viewport_size: Browser viewport size (width, height)
+            stealth_config: Custom stealth configuration
         """
         self.headless = headless
         self.stealth_mode = stealth_mode
@@ -41,11 +44,15 @@ class BrowserAgent:
         self.viewport_size = viewport_size
         self.logger = logger.bind(component="browser_agent")
         
+        # Initialize stealth manager
+        self.stealth_manager = StealthManager(stealth_config) if stealth_mode else None
+        
         # Browser-use and Playwright instances
         self.browser_use_agent = None
         self.playwright = None
         self.browser = None
         self.page = None
+        self.context = None
         
         # Session state
         self.is_initialized = False
@@ -115,11 +122,18 @@ class BrowserAgent:
             
             self.context = await self.browser.new_context(**context_options)
             
+            # Configure stealth mode if enabled
+            if self.stealth_mode and self.stealth_manager:
+                await self.stealth_manager.setup_stealth_context(self.context)
+            
             # Create new page
             self.page = await self.context.new_page()
             
-            # Configure stealth mode JavaScript
-            if self.stealth_mode:
+            # Configure stealth page settings
+            if self.stealth_mode and self.stealth_manager:
+                await self.stealth_manager.setup_stealth_page(self.page)
+            elif self.stealth_mode:
+                # Fallback stealth configuration
                 await self._configure_stealth_mode()
             
             # Initialize Browser-use agent
@@ -208,8 +222,21 @@ class BrowserAgent:
         
         try:
             if self.page:
+                # Add stealth delay before navigation
+                if self.stealth_mode and self.stealth_manager:
+                    await self.stealth_manager.human_like_delay("page_navigation")
+                
                 await self.page.goto(url, wait_until="networkidle")
                 self.current_url = url
+                
+                # Check for bot detection after navigation
+                if self.stealth_mode and self.stealth_manager:
+                    challenges = await self.stealth_manager.detect_bot_challenges(self.page)
+                    if any(challenges.values()):
+                        success = await self.stealth_manager.handle_bot_detection(self.page, challenges)
+                        if not success:
+                            self.logger.error("Bot detection challenge could not be handled", challenges=challenges)
+                            return False
                 
                 self.logger.info(
                     "Navigated to URL",
@@ -364,6 +391,11 @@ class BrowserAgent:
         
         try:
             if self.page:
+                # Add stealth delay and mouse movement
+                if self.stealth_mode and self.stealth_manager:
+                    await self.stealth_manager.human_like_delay("click")
+                    await self.stealth_manager.human_like_mouse_movement(self.page, selector)
+                
                 await self.page.click(selector)
                 
                 self.logger.debug(
@@ -400,7 +432,11 @@ class BrowserAgent:
         
         try:
             if self.page:
-                await self.page.fill(selector, value)
+                # Use human-like typing if stealth mode is enabled
+                if self.stealth_mode and self.stealth_manager:
+                    await self.stealth_manager.human_like_typing(self.page, selector, value)
+                else:
+                    await self.page.fill(selector, value)
                 
                 self.logger.debug(
                     "Form field filled",
@@ -443,6 +479,11 @@ class BrowserAgent:
             self.is_initialized = False
             self.current_url = None
             
+            # Log session statistics if stealth mode was used
+            if self.stealth_mode and self.stealth_manager:
+                stats = self.stealth_manager.get_session_stats()
+                self.logger.info("Browser session completed", **stats)
+            
             self.logger.info("Browser agent closed successfully")
             
         except Exception as e:
@@ -450,13 +491,20 @@ class BrowserAgent:
                 "Error closing browser agent",
                 error=str(e)
             )
+    
+    def get_stealth_stats(self) -> Optional[Dict[str, Any]]:
+        """Get stealth session statistics."""
+        if self.stealth_mode and self.stealth_manager:
+            return self.stealth_manager.get_session_stats()
+        return None
 
 
 def create_browser_agent(
     headless: bool = True,
     stealth_mode: bool = True,
     user_data_dir: Optional[str] = None,
-    viewport_size: tuple = (1920, 1080)
+    viewport_size: tuple = (1920, 1080),
+    stealth_config: Optional[StealthConfig] = None
 ) -> BrowserAgent:
     """
     Factory function to create a browser agent.
@@ -466,6 +514,7 @@ def create_browser_agent(
         stealth_mode: Enable stealth mode to avoid bot detection
         user_data_dir: Custom user data directory for persistent sessions
         viewport_size: Browser viewport size (width, height)
+        stealth_config: Custom stealth configuration
         
     Returns:
         Configured BrowserAgent instance
@@ -474,5 +523,6 @@ def create_browser_agent(
         headless=headless,
         stealth_mode=stealth_mode,
         user_data_dir=user_data_dir,
-        viewport_size=viewport_size
+        viewport_size=viewport_size,
+        stealth_config=stealth_config
     )

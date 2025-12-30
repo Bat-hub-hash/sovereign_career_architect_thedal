@@ -413,7 +413,12 @@ class MemoryClient:
     
     async def _add_to_mock_storage(self, memory: Memory) -> None:
         """Add memory to mock storage."""
-        key = f"{memory.user_id}:{memory.scope.value}"
+        # For session memories, include session_id in the key for proper isolation
+        if memory.scope == MemoryScope.SESSION and memory.session_id:
+            key = f"{memory.user_id}:{memory.scope.value}:{memory.session_id}"
+        else:
+            key = f"{memory.user_id}:{memory.scope.value}"
+        
         if key not in self._memory_store:
             self._memory_store[key] = []
         self._memory_store[key].append(memory)
@@ -717,12 +722,22 @@ class MemoryClient:
         # Simulate async operation
         await asyncio.sleep(0.01)
         
-        key = f"{user_id}:{scope.value}"
-        memories = self._memory_store.get(key, [])
-        
-        # Filter by session_id for session-scoped memories
+        # For session memories, use session-specific key if session_id is provided
         if scope == MemoryScope.SESSION and session_id is not None:
-            memories = [m for m in memories if m.session_id == session_id]
+            key = f"{user_id}:{scope.value}:{session_id}"
+            memories = self._memory_store.get(key, [])
+        else:
+            # For non-session memories or when no session_id is provided
+            key = f"{user_id}:{scope.value}"
+            memories = self._memory_store.get(key, [])
+            
+            # For session scope without session_id, collect from all sessions
+            if scope == MemoryScope.SESSION and session_id is None:
+                all_session_memories = []
+                for storage_key in self._memory_store.keys():
+                    if storage_key.startswith(f"{user_id}:{scope.value}:"):
+                        all_session_memories.extend(self._memory_store[storage_key])
+                memories = all_session_memories
         
         if not query:
             return memories[:limit]
@@ -1131,13 +1146,22 @@ class MemoryClient:
         # Simulate async operation
         await asyncio.sleep(0.01)
         
-        # Return empty list for now - in production this would use Mem0
-        key = f"{user_id}:{scope.value}"
-        memories = self._memory_store.get(key, [])
-        
-        # Filter by session_id for session-scoped memories
+        # For session memories, use session-specific key if session_id is provided
         if scope == MemoryScope.SESSION and session_id is not None:
-            memories = [m for m in memories if m.session_id == session_id]
+            key = f"{user_id}:{scope.value}:{session_id}"
+            memories = self._memory_store.get(key, [])
+        else:
+            # For non-session memories or when no session_id is provided
+            key = f"{user_id}:{scope.value}"
+            memories = self._memory_store.get(key, [])
+            
+            # For session scope without session_id, collect from all sessions
+            if scope == MemoryScope.SESSION and session_id is None:
+                all_session_memories = []
+                for storage_key in self._memory_store.keys():
+                    if storage_key.startswith(f"{user_id}:{scope.value}:"):
+                        all_session_memories.extend(self._memory_store[storage_key])
+                memories = all_session_memories
         
         # Simple keyword matching for mock implementation
         if query:

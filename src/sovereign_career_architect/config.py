@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     mem0_api_key: Optional[str] = Field(None, description="Mem0 API key")
     vapi_api_key: Optional[str] = Field(None, description="Vapi.ai API key")
     sarvam_api_key: Optional[str] = Field(None, description="Sarvam-1 API key")
+    huggingface_api_key: Optional[str] = Field(None, description="Hugging Face API key for Sarvam-1")
     
     # Model Configuration
     reasoning_model: str = Field("llama-3.1-70b-versatile", description="High-reasoning model")

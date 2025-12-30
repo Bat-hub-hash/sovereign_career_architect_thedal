@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 import json
 import structlog
 
-from sovereign_career_architect.core.models import AgentState, ActionResult
+from sovereign_career_architect.core.state import AgentState
+from sovereign_career_architect.core.models import ActionResult
 
 logger = structlog.get_logger(__name__)
 

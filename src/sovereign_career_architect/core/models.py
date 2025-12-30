@@ -40,7 +40,7 @@ class Skill(BaseModel):
     """Represents a user skill."""
     name: str = Field(..., description="Skill name")
     level: str = Field(..., description="Proficiency level")
-    years_experience: Optional[int] = Field(None, description="Years of experience")
+    years_experience: Optional[float] = Field(None, description="Years of experience")
     verified: bool = Field(False, description="Whether skill is verified")
 
 

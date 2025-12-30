@@ -10,7 +10,7 @@ __version__ = "0.1.0"
 __author__ = "AI-VERSE Team"
 __email__ = "team@aiverse.com"
 
-from sovereign_career_architect.core.agent import SovereignCareerAgent
+from sovereign_career_architect.core.agent import SovereignCareerArchitect
 from sovereign_career_architect.core.state import AgentState
 from sovereign_career_architect.memory.client import MemoryClient
 from sovereign_career_architect.browser.agent import BrowserAgent

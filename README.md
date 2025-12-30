@@ -37,7 +37,7 @@ Memory Layer  Browser Agent  Safety Layer
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/aiverse/sovereign-career-architect.git
+git clone https://github.com/Keerthivasan-Venkitajalam/Thedal
 cd sovereign-career-architect
 ```
 

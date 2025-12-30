@@ -44,7 +44,10 @@ cd sovereign-career-architect
 2. Create virtual environment:
 ```bash
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# On Linux/Mac:
+source venv/bin/activate
+# On Windows (PowerShell):
+.\venv\Scripts\activate
 ```
 
 3. Install dependencies:
@@ -60,7 +63,7 @@ cp .env.example .env
 
 5. Install Playwright browsers:
 ```bash
-playwright install
+python -m playwright install
 ```
 
 ### Running the Application

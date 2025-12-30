@@ -11,7 +11,8 @@ from sovereign_career_architect.core.safety import (
     SafetyLayer, ActionClassifier, ActionSummarizer, ActionRisk, ActionCategory,
     ActionClassification, ActionSummary, ApprovalRequest
 )
-from sovereign_career_architect.core.models import AgentState, ActionResult
+from sovereign_career_architect.core.models import ActionResult
+from sovereign_career_architect.core.state import AgentState
 
 
 class TestSafetyLayerProperties:

@@ -14,7 +14,7 @@ from sovereign_career_architect.api.models import (
     JobSearchRequest, JobSearchResponse, InterviewRequest, InterviewResponse,
     ErrorResponse, StatusResponse
 )
-from sovereign_career_architect.core.agent import SovereignCareerArchitect
+from sovereign_career_architect.core.agent import SovereignCareerAgent
 from sovereign_career_architect.core.safety import SafetyLayer
 from sovereign_career_architect.browser.agent import BrowserAgent
 from sovereign_career_architect.config import settings
@@ -24,7 +24,7 @@ logger = get_logger(__name__)
 security = HTTPBearer(auto_error=False)
 
 # Global instances (will be properly initialized in main.py)
-agent: Optional[SovereignCareerArchitect] = None
+agent: Optional[SovereignCareerAgent] = None
 safety_layer: Optional[SafetyLayer] = None
 browser_agent: Optional[BrowserAgent] = None
 

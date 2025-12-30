@@ -1,0 +1,164 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sovereign-career-architect"
+version = "0.1.0"
+description = "An autonomous AI agent for career navigation with cognitive architecture"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "AI-VERSE Team", email = "team@aiverse.com"},
+]
+keywords = ["ai", "agent", "career", "langgraph", "voice", "automation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    # Core AI/ML Framework
+    "langgraph>=0.2.0",
+    "langchain>=0.3.0",
+    "langchain-community>=0.3.0",
+    "langchain-openai>=0.2.0",
+    "langchain-groq>=0.2.0",
+    
+    # Memory and Vector Store
+    "mem0ai>=0.1.0",
+    "qdrant-client>=1.11.0",
+    "chromadb>=0.5.0",
+    
+    # Browser Automation
+    "browser-use>=0.1.0",
+    "playwright>=1.48.0",
+    "selenium>=4.25.0",
+    
+    # Voice and Audio
+    "openai>=1.50.0",  # For GPT-4o vision
+    "requests>=2.32.0",  # For Vapi.ai webhooks
+    "websockets>=12.0",  # For real-time voice
+    
+    # Web Framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    
+    # Data Processing
+    "pandas>=2.2.0",
+    "numpy>=2.1.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.3.0",
+    
+    # Utilities
+    "python-dotenv>=1.0.0",
+    "structlog>=24.4.0",
+    "rich>=13.9.0",
+    "typer>=0.12.0",
+    
+    # Testing
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "hypothesis>=6.112.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.10.0",
+    "isort>=5.13.0",
+    "flake8>=7.1.0",
+    "mypy>=1.13.0",
+    "pre-commit>=4.0.0",
+    "pytest-cov>=6.0.0",
+    "pytest-xdist>=3.6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/aiverse/sovereign-career-architect"
+Repository = "https://github.com/aiverse/sovereign-career-architect"
+Documentation = "https://docs.aiverse.com/sovereign-career-architect"
+
+[project.scripts]
+sca = "sovereign_career_architect.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sovereign_career_architect"]
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["sovereign_career_architect"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "property: marks tests as property-based tests",
+    "unit: marks tests as unit tests",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/tests/*", "*/test_*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]

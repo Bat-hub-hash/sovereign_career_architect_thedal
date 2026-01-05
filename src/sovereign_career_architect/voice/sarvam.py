@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import requests
+from functools import lru_cache
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
@@ -12,6 +14,131 @@ from sovereign_career_architect.config import settings
 from sovereign_career_architect.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+# =============================================================================
+# Translation Layer with LRU Cache (as specified by Member 3: The Voice)
+# =============================================================================
+
+# Simple in-memory cache for translations (max 200 items)
+_translation_cache: Dict[Tuple[str, str], str] = {}
+_CACHE_MAX_SIZE = 200
+
+
+def translate_text(text: str, target_lang: str) -> str:
+    """
+    Translate text to target language using Sarvam API with caching.
+    
+    This function implements:
+    - LRU-style caching with max 200 items
+    - Sarvam API integration via requests
+    - Graceful error handling (returns original text on failure)
+    
+    Args:
+        text: The text to translate
+        target_lang: Target language code (e.g., "en", "hi", "ta")
+        
+    Returns:
+        Translated text, or original text if translation fails
+    """
+    global _translation_cache
+    
+    # Skip translation if text is empty
+    if not text or not text.strip():
+        return text
+    
+    # Create cache key
+    cache_key = (text, target_lang)
+    
+    # Check cache first
+    if cache_key in _translation_cache:
+        logger.debug("Translation cache hit", target_lang=target_lang, text_preview=text[:50])
+        return _translation_cache[cache_key]
+    
+    # Get API key from settings
+    api_key = settings.sarvam_api_key
+    
+    if not api_key:
+        logger.warning("Sarvam API key not configured, returning original text")
+        return text
+    
+    try:
+        # Call Sarvam Translation API
+        response = requests.post(
+            "https://api.sarvam.ai/translate",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "input": text,
+                "source_language_code": "auto",  # Auto-detect source
+                "target_language_code": target_lang,
+                "mode": "formal"  # Use formal mode for professional context
+            },
+            timeout=10.0
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            translated_text = result.get("translated_text", text)
+            
+            # Manage cache size (remove oldest entries if at capacity)
+            if len(_translation_cache) >= _CACHE_MAX_SIZE:
+                # Remove first 20 entries (simple FIFO-style cleanup)
+                keys_to_remove = list(_translation_cache.keys())[:20]
+                for key in keys_to_remove:
+                    del _translation_cache[key]
+            
+            # Store in cache
+            _translation_cache[cache_key] = translated_text
+            
+            logger.info(
+                "Translation successful",
+                target_lang=target_lang,
+                original_length=len(text),
+                translated_length=len(translated_text)
+            )
+            
+            return translated_text
+        else:
+            logger.error(
+                "Sarvam API error",
+                status_code=response.status_code,
+                response_text=response.text[:200]
+            )
+            return text  # Fallback to original text
+            
+    except requests.exceptions.Timeout:
+        logger.error("Sarvam API timeout", target_lang=target_lang)
+        return text
+    except requests.exceptions.RequestException as e:
+        logger.error("Sarvam API request failed", error=str(e))
+        return text
+    except Exception as e:
+        logger.error("Translation failed unexpectedly", error=str(e))
+        return text
+
+
+def clear_translation_cache() -> None:
+    """Clear the translation cache."""
+    global _translation_cache
+    _translation_cache.clear()
+    logger.info("Translation cache cleared")
+
+
+def get_translation_cache_stats() -> Dict[str, Any]:
+    """Get translation cache statistics."""
+    return {
+        "size": len(_translation_cache),
+        "max_size": _CACHE_MAX_SIZE,
+        "usage_percent": (len(_translation_cache) / _CACHE_MAX_SIZE) * 100
+    }
+
+
+# =============================================================================
+# Existing Sarvam-1 Integration Code
+# =============================================================================
 
 
 class IndicLanguage(Enum):

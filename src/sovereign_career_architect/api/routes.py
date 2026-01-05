@@ -3,8 +3,9 @@
 import asyncio
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
 import structlog
 
 from sovereign_career_architect.api.models import (
@@ -14,11 +15,12 @@ from sovereign_career_architect.api.models import (
     JobSearchRequest, JobSearchResponse, InterviewRequest, InterviewResponse,
     ErrorResponse, StatusResponse
 )
-from sovereign_career_architect.core.agent import SovereignCareerAgent
+from sovereign_career_architect.core.agent import SovereignCareerArchitect as SovereignCareerAgent
 from sovereign_career_architect.core.safety import SafetyLayer
 from sovereign_career_architect.browser.agent import BrowserAgent
 from sovereign_career_architect.config import settings
 from sovereign_career_architect.utils.logging import get_logger
+from sovereign_career_architect.voice.orchestrator import process_voice_text
 
 logger = get_logger(__name__)
 security = HTTPBearer(auto_error=False)
@@ -294,56 +296,179 @@ async def execute_browser_action(
         raise HTTPException(status_code=500, detail=f"Browser action failed: {str(e)}")
 
 
-@voice_router.post("/webhook", response_model=VoiceWebhookResponse)
-async def handle_voice_webhook(request: VoiceWebhookRequest):
-    """Handle webhook from Vapi.ai voice interface."""
+@voice_router.post("/webhook")
+async def handle_voice_webhook(request: Request):
+    """
+    Handle webhook from Vapi.ai voice interface.
+    
+    This endpoint processes Vapi webhooks, specifically looking for:
+    - message.type == "function-call" events
+    
+    It extracts the function name, arguments, and transcript, then calls
+    the voice orchestrator to process the request.
+    
+    Returns JSON in Vapi's expected format:
+    {
+        "results": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "<response_text>",
+                "metadata": { "raw_en": "<english_response>" }
+            }
+        ]
+    }
+    """
     try:
+        # Parse the raw JSON payload from Vapi
+        payload = await request.json()
+        
         logger.info(
             "Voice webhook received",
-            event_type=request.event_type,
-            call_id=request.call_id,
-            user_id=request.user_id
+            payload_keys=list(payload.keys()) if isinstance(payload, dict) else "not_dict"
         )
         
-        # Process different webhook events
-        if request.event_type == "function_call":
-            # Handle function call from voice interface
-            if request.function_call:
-                function_name = request.function_call.get("name")
-                function_args = request.function_call.get("arguments", {})
-                
-                # Route to appropriate handler
-                result = await handle_voice_function_call(function_name, function_args)
-                
-                return VoiceWebhookResponse(
-                    success=True,
-                    function_result=result,
-                    message="Function executed successfully"
-                )
+        # Extract message information from Vapi payload
+        message = payload.get("message", {})
+        message_type = message.get("type", "")
         
-        elif request.event_type == "transcript":
-            # Handle voice transcript
-            if request.transcript:
-                # Process the transcript with the agent
-                response = await process_voice_transcript(request.transcript, request.user_id)
-                
-                return VoiceWebhookResponse(
-                    success=True,
-                    message=response.get("message", "Transcript processed"),
-                    next_action=response.get("next_action")
-                )
+        # Handle function-call messages from Vapi
+        if message_type == "function-call":
+            # Extract function details
+            function_call = message.get("functionCall", {})
+            function_name = function_call.get("name", "unknown")
+            function_args = function_call.get("parameters", {})
+            
+            # Extract transcript/user input
+            # Vapi provides transcript in various places depending on the event
+            transcript = ""
+            if "transcript" in message:
+                transcript = message.get("transcript", "")
+            elif "input" in function_args:
+                transcript = function_args.get("input", "")
+            elif "query" in function_args:
+                transcript = function_args.get("query", "")
+            elif "text" in function_args:
+                transcript = function_args.get("text", "")
+            
+            # Extract user and language info
+            call_data = payload.get("call", {})
+            user_id = call_data.get("customerId", payload.get("userId", "anonymous"))
+            
+            # Try to detect source language from Vapi metadata or default to English
+            assistant_data = call_data.get("assistant", {})
+            transcriber_data = assistant_data.get("transcriber", {})
+            source_lang = transcriber_data.get("language", "en")
+            
+            # Also check function args for language preference
+            if "language" in function_args:
+                source_lang = function_args.get("language", source_lang)
+            
+            logger.info(
+                "Processing function call",
+                function_name=function_name,
+                user_id=user_id,
+                source_lang=source_lang,
+                transcript_preview=transcript[:100] if transcript else "empty"
+            )
+            
+            # Use the transcript or construct from function args
+            input_text = transcript if transcript else str(function_args)
+            
+            # Call the voice orchestrator to process the text
+            result = process_voice_text(
+                user_id=user_id,
+                text=input_text,
+                source_lang=source_lang
+            )
+            
+            # Return Vapi-formatted response
+            return JSONResponse(content={
+                "results": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": result["final_text"],
+                        "metadata": {
+                            "raw_en": result["agent_text_en"],
+                            "function_name": function_name,
+                            "source_lang": source_lang
+                        }
+                    }
+                ]
+            })
         
-        # Default response for unhandled events
-        return VoiceWebhookResponse(
-            success=True,
-            message="Webhook received and processed"
+        # Handle other message types (transcript, call events, etc.)
+        elif message_type in ["transcript", "speech-update"]:
+            # For transcript events, just acknowledge receipt
+            return JSONResponse(content={
+                "results": [
+                    {
+                        "type": "acknowledge",
+                        "role": "system",
+                        "content": "Transcript received",
+                        "metadata": {"message_type": message_type}
+                    }
+                ]
+            })
+        
+        elif message_type in ["call-started", "call-ended"]:
+            # Log call lifecycle events
+            call_id = payload.get("call", {}).get("id", "unknown")
+            logger.info(f"Call event: {message_type}", call_id=call_id)
+            
+            return JSONResponse(content={
+                "results": [
+                    {
+                        "type": "acknowledge",
+                        "role": "system", 
+                        "content": f"Call event {message_type} acknowledged",
+                        "metadata": {"call_id": call_id}
+                    }
+                ]
+            })
+        
+        # Default response for unhandled message types
+        logger.warning(
+            "Unhandled message type",
+            message_type=message_type,
+            payload_preview=str(payload)[:200]
         )
+        
+        return JSONResponse(content={
+            "results": [
+                {
+                    "type": "acknowledge",
+                    "role": "system",
+                    "content": "Webhook received",
+                    "metadata": {"message_type": message_type}
+                }
+            ]
+        })
         
     except Exception as e:
-        logger.error("Voice webhook error", error=str(e), event_type=request.event_type)
-        return VoiceWebhookResponse(
-            success=False,
-            message=f"Webhook processing failed: {str(e)}"
+        # CRUCIAL: Never let the server error out - return safe error JSON
+        logger.error(
+            "Voice webhook error",
+            error=str(e),
+            error_type=type(e).__name__
+        )
+        
+        return JSONResponse(
+            status_code=200,  # Return 200 to prevent Vapi retries
+            content={
+                "results": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": "I apologize, but I encountered a technical issue. Could you please repeat your request?",
+                        "metadata": {
+                            "error": True,
+                            "error_message": str(e)[:100]
+                        }
+                    }
+                ]
+            }
         )
 
 
@@ -469,27 +594,47 @@ async def log_agent_interaction(user_id: str, session_id: str, message: str, res
 
 
 async def handle_voice_function_call(function_name: str, function_args: Dict[str, Any]) -> Dict[str, Any]:
-    """Handle function calls from voice interface."""
-    logger.info("Voice function call", function_name=function_name, args=function_args)
+    """
+    Handle function calls from voice interface.
     
-    # Route to appropriate function handler
-    if function_name == "search_jobs":
-        # Handle job search function
-        return {"result": "Job search initiated", "status": "success"}
-    elif function_name == "apply_to_job":
-        # Handle job application function
-        return {"result": "Job application started", "status": "success"}
-    else:
-        return {"result": f"Unknown function: {function_name}", "status": "error"}
+    This is a legacy handler kept for backward compatibility.
+    The new webhook handler uses process_voice_text from the orchestrator.
+    """
+    logger.info("Voice function call (legacy handler)", function_name=function_name, args=function_args)
+    
+    # Extract user info and text from args
+    user_id = function_args.get("user_id", "anonymous")
+    text = function_args.get("query", function_args.get("text", str(function_args)))
+    source_lang = function_args.get("language", "en")
+    
+    # Use the new orchestrator
+    result = process_voice_text(user_id=user_id, text=text, source_lang=source_lang)
+    
+    return {
+        "result": result["final_text"],
+        "result_en": result["agent_text_en"],
+        "status": "success"
+    }
 
 
 async def process_voice_transcript(transcript: str, user_id: Optional[str]) -> Dict[str, Any]:
-    """Process voice transcript with the agent."""
-    logger.info("Processing voice transcript", transcript_length=len(transcript), user_id=user_id)
+    """
+    Process voice transcript with the agent.
     
-    # In reality, this would integrate with the main agent
+    This is a legacy handler kept for backward compatibility.
+    """
+    logger.info("Processing voice transcript (legacy handler)", transcript_length=len(transcript), user_id=user_id)
+    
+    # Use the new orchestrator
+    result = process_voice_text(
+        user_id=user_id or "anonymous",
+        text=transcript,
+        source_lang="en"  # Assume English for legacy handler
+    )
+    
     return {
-        "message": f"I heard: {transcript}. How can I help you with your job search?",
+        "message": result["final_text"],
+        "message_en": result["agent_text_en"],
         "next_action": "wait_for_response"
     }
 

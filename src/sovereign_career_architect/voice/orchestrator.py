@@ -2,7 +2,10 @@
 
 import asyncio
 import json
-from typing import Dict, List, Optional, Any, Callable
+import time
+import re
+import uuid
+from typing import Dict, List, Optional, Any, Callable, Tuple
 from dataclasses import dataclass
 from enum import Enum
 import structlog
@@ -10,9 +13,790 @@ import httpx
 
 from sovereign_career_architect.config import settings
 from sovereign_career_architect.utils.logging import get_logger
-from sovereign_career_architect.voice.sarvam import SarvamClient, LanguageRouter, IndicLanguage
+from sovereign_career_architect.voice.sarvam import SarvamClient, LanguageRouter, IndicLanguage, translate_text
 
 logger = get_logger(__name__)
+
+
+# =============================================================================
+# Configuration Flags
+# =============================================================================
+
+# Dry-run mode: When enabled, skips agent execution and returns test response
+# Set to True for testing/demo without hitting the real agent
+DRY_RUN_MODE: bool = False
+
+# Dry-run response (deterministic for testing)
+_DRY_RUN_RESPONSE = "Voice system is running in test mode."
+
+# Long-running agent threshold (milliseconds)
+# If agent execution exceeds this, log a warning for observability
+LONG_RUNNING_THRESHOLD_MS: float = 1500.0  # 1.5 seconds
+
+
+# =============================================================================
+# Error Classification
+# =============================================================================
+
+class VoiceErrorType(Enum):
+    """Classification of voice processing errors."""
+    TRANSLATION_ERROR = "translation_error"
+    AGENT_ERROR = "agent_error"
+    TIMEOUT = "timeout"
+    EMPTY_INPUT = "empty_input"
+    EMPTY_AGENT_RESPONSE = "empty_agent_response"
+    UNKNOWN = "unknown"
+
+
+# =============================================================================
+# Voice Audit Trail
+# =============================================================================
+
+@dataclass
+class VoiceAuditRecord:
+    """
+    Internal audit record for voice interactions.
+    
+    This captures all relevant metrics and flags for a single voice request.
+    Used for observability and debugging - NOT returned to users.
+    """
+    voice_trace_id: str
+    user_id: str
+    session_id: str
+    source_lang: str
+    input_text_length: int = 0
+    was_translated_in: bool = False
+    was_translated_out: bool = False
+    agent_invoked: bool = False
+    agent_latency_ms: float = 0.0
+    translate_in_latency_ms: float = 0.0
+    translate_out_latency_ms: float = 0.0
+    total_latency_ms: float = 0.0
+    fallback_used: bool = False
+    dry_run: bool = False
+    long_running: bool = False
+    success: bool = False
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for logging."""
+        return {
+            "voice_trace_id": self.voice_trace_id,
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+            "source_lang": self.source_lang,
+            "input_text_length": self.input_text_length,
+            "was_translated_in": self.was_translated_in,
+            "was_translated_out": self.was_translated_out,
+            "agent_invoked": self.agent_invoked,
+            "agent_latency_ms": round(self.agent_latency_ms, 2),
+            "translate_in_latency_ms": round(self.translate_in_latency_ms, 2),
+            "translate_out_latency_ms": round(self.translate_out_latency_ms, 2),
+            "total_latency_ms": round(self.total_latency_ms, 2),
+            "fallback_used": self.fallback_used,
+            "dry_run": self.dry_run,
+            "long_running": self.long_running,
+            "success": self.success,
+            "error_type": self.error_type,
+            "error_message": self.error_message,
+        }
+
+
+def _log_audit_summary(audit: VoiceAuditRecord) -> None:
+    """
+    Log the voice audit summary.
+    
+    This is the single consolidated log event for the entire voice request.
+    Wrapped in try/except to ensure audit failures never break processing.
+    """
+    try:
+        logger.info(
+            "voice.audit.summary",
+            **audit.to_dict()
+        )
+    except Exception:
+        # Silently ignore audit logging failures - stability first
+        pass
+
+
+def _log_error_classified(
+    voice_trace_id: str,
+    user_id: str,
+    session_id: str,
+    error_type: VoiceErrorType,
+    error_message: str
+) -> None:
+    """
+    Log a classified error event.
+    
+    Wrapped in try/except for stability.
+    """
+    try:
+        logger.error(
+            "voice.error.classified",
+            voice_trace_id=voice_trace_id,
+            user_id=user_id,
+            session_id=session_id,
+            error_type=error_type.value,
+            error_message=error_message[:200] if error_message else None
+        )
+    except Exception:
+        # Silently ignore - stability first
+        pass
+
+
+def _generate_trace_id() -> str:
+    """Generate a unique voice trace ID."""
+    return f"vtrace_{uuid.uuid4().hex[:16]}"
+
+
+# =============================================================================
+# Streaming & UX Helpers
+# =============================================================================
+
+# Early acknowledgement phrases (for future streaming support)
+_ACKNOWLEDGEMENT_PHRASES = [
+    "Okay, I'm checking that for you.",
+    "Let me look into that.",
+    "One moment, please.",
+    "I'm on it.",
+    "Let me find that information.",
+]
+
+
+def _get_acknowledgement(user_input: str) -> str:
+    """
+    Generate an early acknowledgement phrase based on user input.
+    
+    This is for future streaming support - provides immediate feedback
+    while the agent processes the request.
+    
+    Args:
+        user_input: The user's input text
+        
+    Returns:
+        An appropriate acknowledgement phrase
+    """
+    # Simple heuristic: choose phrase based on input characteristics
+    input_lower = user_input.lower() if user_input else ""
+    
+    if any(word in input_lower for word in ["find", "search", "look", "show"]):
+        return "Let me find that information."
+    elif any(word in input_lower for word in ["help", "can you", "could you"]):
+        return "I'm on it."
+    elif "?" in user_input:
+        return "Let me check that for you."
+    else:
+        # Default acknowledgement
+        return "Okay, I'm checking that for you."
+
+
+def _segment_response(text: str) -> Tuple[str, str]:
+    """
+    Segment response into first sentence and remaining text.
+    
+    This prepares the response for future Vapi streaming TTS support,
+    allowing the first sentence to be spoken quickly while the rest loads.
+    
+    Args:
+        text: Full response text
+        
+    Returns:
+        Tuple of (first_sentence, remaining_text)
+        
+    Note: This is INTERNAL ONLY. The final returned response is always
+    the complete, unsegmented text.
+    """
+    if not text or not isinstance(text, str):
+        return "", ""
+    
+    text = text.strip()
+    
+    # Sentence-ending patterns (handles ., !, ?)
+    # Also handles common abbreviations to avoid false splits
+    sentence_end_pattern = r'(?<![A-Z])(?<![A-Z]\.)(?<!\s[A-Z])(?<![0-9])[.!?](?=\s|$)'
+    
+    match = re.search(sentence_end_pattern, text)
+    
+    if match:
+        split_pos = match.end()
+        first_sentence = text[:split_pos].strip()
+        remaining = text[split_pos:].strip()
+        return first_sentence, remaining
+    else:
+        # No sentence break found - return all as first sentence
+        return text, ""
+
+
+def _log_response_segments(
+    user_id: str,
+    session_id: str,
+    first_sentence: str,
+    remaining_text: str
+) -> None:
+    """
+    Log response segmentation for streaming observability.
+    
+    This is internal logging only - does not affect response format.
+    """
+    logger.debug(
+        "voice.response.segmented",
+        user_id=user_id,
+        session_id=session_id,
+        first_sentence_length=len(first_sentence),
+        remaining_length=len(remaining_text),
+        first_sentence_preview=first_sentence[:50] if first_sentence else ""
+    )
+
+
+# =============================================================================
+# Core Agent Integration
+# =============================================================================
+
+# Global agent instance (lazily initialized)
+_agent_instance: Optional[Any] = None
+_agent_initialized: bool = False
+
+
+def _get_or_create_agent():
+    """
+    Get or create the SovereignCareerArchitect agent instance.
+    
+    Uses lazy initialization to avoid circular imports and ensure
+    the agent is only created when needed.
+    """
+    global _agent_instance, _agent_initialized
+    
+    if _agent_instance is None and not _agent_initialized:
+        init_start = time.monotonic()
+        try:
+            from sovereign_career_architect.core.agent import SovereignCareerArchitect
+            _agent_instance = SovereignCareerArchitect(
+                enable_voice=False,  # Avoid circular dependency
+                enable_browser=False,  # Lightweight for voice processing
+                enable_interrupts=False  # No HITL for voice responses
+            )
+            _agent_initialized = True
+            init_elapsed = (time.monotonic() - init_start) * 1000
+            logger.info(
+                "voice.agent.init",
+                status="success",
+                elapsed_ms=round(init_elapsed, 2)
+            )
+        except Exception as e:
+            init_elapsed = (time.monotonic() - init_start) * 1000
+            logger.error(
+                "voice.agent.init",
+                status="error",
+                error=str(e),
+                error_type=type(e).__name__,
+                elapsed_ms=round(init_elapsed, 2)
+            )
+            _agent_initialized = True  # Mark as attempted to avoid repeated failures
+    
+    return _agent_instance
+
+
+def _invoke_agent(user_id: str, text: str, session_id: Optional[str] = None) -> str:
+    """
+    Invoke the LangGraph agent with user input.
+    
+    This function handles the async-to-sync bridge and provides
+    defensive error handling.
+    
+    Args:
+        user_id: User identifier
+        text: Input text in English
+        session_id: Optional session ID (auto-generated if not provided)
+        
+    Returns:
+        Agent response as plain English string
+    """
+    # Handle dry-run mode
+    if DRY_RUN_MODE:
+        logger.info(
+            "voice.agent.invoke.dry_run",
+            user_id=user_id,
+            session_id=session_id
+        )
+        return _DRY_RUN_RESPONSE
+    
+    agent = _get_or_create_agent()
+    
+    if agent is None:
+        logger.warning(
+            "voice.agent.invoke.unavailable",
+            user_id=user_id,
+            reason="agent_not_initialized"
+        )
+        return "I'm currently unable to process your request. Please try again later."
+    
+    # Generate session ID if not provided
+    if session_id is None:
+        import uuid
+        session_id = f"voice_{user_id}_{uuid.uuid4().hex[:8]}"
+    
+    invoke_start = time.monotonic()
+    
+    logger.info(
+        "voice.agent.invoke.start",
+        user_id=user_id,
+        session_id=session_id,
+        input_length=len(text)
+    )
+    
+    try:
+        # Check if we're already in an async context
+        try:
+            loop = asyncio.get_running_loop()
+            # We're in an async context, need to handle differently
+            # Create a new thread to run the async code
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    asyncio.run,
+                    agent.process_user_request(
+                        user_id=user_id,
+                        session_id=session_id,
+                        message=text
+                    )
+                )
+                result = future.result(timeout=30.0)
+        except RuntimeError:
+            # No running loop, we can use asyncio.run directly
+            result = asyncio.run(
+                agent.process_user_request(
+                    user_id=user_id,
+                    session_id=session_id,
+                    message=text
+                )
+            )
+        
+        invoke_elapsed = (time.monotonic() - invoke_start) * 1000
+        
+        # Extract the response message with validation
+        response = None
+        if isinstance(result, dict):
+            response = result.get("message")
+            if result.get("success") is False:
+                logger.warning(
+                    "voice.agent.invoke.unsuccessful",
+                    user_id=user_id,
+                    session_id=session_id,
+                    result_keys=list(result.keys())
+                )
+        elif result is not None:
+            response = str(result)
+        
+        # Guardrail: Handle empty or malformed output
+        if not response or not isinstance(response, str) or len(response.strip()) == 0:
+            logger.warning(
+                "voice.agent.invoke.empty_response",
+                user_id=user_id,
+                session_id=session_id,
+                raw_result_type=type(result).__name__
+            )
+            response = "I processed your request but couldn't generate a response. Please try again."
+        
+        # Long-running detection for observability
+        if invoke_elapsed > LONG_RUNNING_THRESHOLD_MS:
+            logger.warning(
+                "voice.agent.long_running",
+                user_id=user_id,
+                session_id=session_id,
+                elapsed_ms=round(invoke_elapsed, 2),
+                threshold_ms=LONG_RUNNING_THRESHOLD_MS
+            )
+        
+        logger.info(
+            "voice.agent.invoke.success",
+            user_id=user_id,
+            session_id=session_id,
+            response_length=len(response),
+            elapsed_ms=round(invoke_elapsed, 2)
+        )
+        
+        return response
+        
+    except asyncio.TimeoutError:
+        invoke_elapsed = (time.monotonic() - invoke_start) * 1000
+        logger.error(
+            "voice.agent.invoke.timeout",
+            user_id=user_id,
+            session_id=session_id,
+            elapsed_ms=round(invoke_elapsed, 2)
+        )
+        return "I'm taking longer than expected to process your request. Please try again."
+    except Exception as e:
+        invoke_elapsed = (time.monotonic() - invoke_start) * 1000
+        logger.error(
+            "voice.agent.invoke.error",
+            user_id=user_id,
+            session_id=session_id,
+            error=str(e),
+            error_type=type(e).__name__,
+            elapsed_ms=round(invoke_elapsed, 2)
+        )
+        return "I encountered an error while processing your request. Please try again."
+
+
+def _safe_translate(text: str, target_lang: str, fallback: str) -> tuple:
+    """
+    Safely translate text with fallback on failure.
+    
+    Returns:
+        Tuple of (translated_text, success_flag, elapsed_ms)
+    """
+    if not text:
+        return fallback, False, 0.0
+    
+    translate_start = time.monotonic()
+    try:
+        translated = translate_text(text, target_lang=target_lang)
+        elapsed = (time.monotonic() - translate_start) * 1000
+        
+        # Validate translation result
+        if translated and isinstance(translated, str) and len(translated.strip()) > 0:
+            return translated, True, elapsed
+        else:
+            logger.warning(
+                "voice.translate.empty_result",
+                target_lang=target_lang,
+                input_length=len(text)
+            )
+            return fallback, False, elapsed
+            
+    except Exception as e:
+        elapsed = (time.monotonic() - translate_start) * 1000
+        logger.error(
+            "voice.translate.error",
+            target_lang=target_lang,
+            error=str(e),
+            elapsed_ms=round(elapsed, 2)
+        )
+        return fallback, False, elapsed
+
+
+# =============================================================================
+# Voice Text Processing (as specified by Member 3: The Voice)
+# =============================================================================
+
+def process_voice_text(user_id: str, text: str, source_lang: str) -> dict:
+    """
+    Bridge between Vapi and the Core Agent.
+    
+    This function:
+    1. Detects language and translates to English if needed
+    2. Calls the Core Agent
+    3. Translates the response back to the source language if needed
+    
+    Args:
+        user_id: The unique identifier for the user
+        text: The input text from the voice interface
+        source_lang: The source language code (e.g., "en", "hi", "ta")
+        
+    Returns:
+        Dictionary with:
+        - final_text: The response in the source language
+        - agent_text_en: The response in English
+    
+    Note: This function NEVER raises exceptions. All errors return safe fallbacks.
+    """
+    # Start total latency measurement
+    total_start = time.monotonic()
+    
+    # Generate unique trace ID for this voice request (end-to-end correlation)
+    voice_trace_id = _generate_trace_id()
+    
+    # Generate session ID for correlation
+    session_id = f"voice_{user_id}_{uuid.uuid4().hex[:8]}"
+    
+    # Initialize audit record (captures ALL metrics for this request)
+    audit = VoiceAuditRecord(
+        voice_trace_id=voice_trace_id,
+        user_id=user_id,
+        session_id=session_id,
+        source_lang=source_lang,
+        input_text_length=len(text) if text else 0,
+        dry_run=DRY_RUN_MODE
+    )
+    
+    # Initialize latency tracking
+    translate_in_ms = 0.0
+    agent_ms = 0.0
+    translate_out_ms = 0.0
+    
+    try:
+        logger.info(
+            "voice.process.start",
+            voice_trace_id=voice_trace_id,
+            user_id=user_id,
+            session_id=session_id,
+            source_lang=source_lang,
+            text_length=len(text) if text else 0
+        )
+        
+        # Guardrail: Handle empty input
+        if not text or not text.strip():
+            logger.warning(
+                "voice.process.empty_input",
+                voice_trace_id=voice_trace_id,
+                user_id=user_id,
+                session_id=session_id
+            )
+            audit.error_type = VoiceErrorType.EMPTY_INPUT.value
+            audit.error_message = "Empty or whitespace-only input"
+            _log_error_classified(
+                voice_trace_id, user_id, session_id,
+                VoiceErrorType.EMPTY_INPUT,
+                "Empty or whitespace-only input"
+            )
+            fallback_en = "I didn't catch that. Could you please repeat?"
+            
+            # Finalize audit
+            audit.total_latency_ms = (time.monotonic() - total_start) * 1000
+            audit.fallback_used = True
+            _log_audit_summary(audit)
+            
+            return {
+                "final_text": fallback_en,
+                "agent_text_en": fallback_en
+            }
+        
+        # Generate early acknowledgement (for future streaming support)
+        # This is logged for observability but not returned separately
+        acknowledgement = _get_acknowledgement(text)
+        logger.debug(
+            "voice.acknowledgement.prepared",
+            voice_trace_id=voice_trace_id,
+            user_id=user_id,
+            session_id=session_id,
+            acknowledgement=acknowledgement
+        )
+        
+        # Step 1: Translate to English if source language is not English
+        if source_lang.lower() != "en":
+            text_in_english, translate_success, translate_in_ms = _safe_translate(
+                text, target_lang="en", fallback=text
+            )
+            audit.was_translated_in = translate_success
+            audit.translate_in_latency_ms = translate_in_ms
+            
+            if not translate_success:
+                audit.error_type = VoiceErrorType.TRANSLATION_ERROR.value
+                audit.error_message = "Input translation failed"
+            
+            logger.info(
+                "voice.translate.input",
+                voice_trace_id=voice_trace_id,
+                user_id=user_id,
+                session_id=session_id,
+                source_lang=source_lang,
+                target_lang="en",
+                success=translate_success,
+                elapsed_ms=round(translate_in_ms, 2)
+            )
+        else:
+            text_in_english = text
+        
+        # Step 2: Call the Core Agent (LangGraph-based)
+        agent_start = time.monotonic()
+        audit.agent_invoked = True
+        
+        agent_response_en = _invoke_agent(
+            user_id=user_id,
+            text=text_in_english,
+            session_id=session_id
+        )
+        agent_ms = (time.monotonic() - agent_start) * 1000
+        audit.agent_latency_ms = agent_ms
+        
+        # Check for long-running agent
+        if agent_ms > LONG_RUNNING_THRESHOLD_MS:
+            audit.long_running = True
+        
+        # Guardrail: Validate agent response
+        if not agent_response_en or not isinstance(agent_response_en, str):
+            audit.error_type = VoiceErrorType.EMPTY_AGENT_RESPONSE.value
+            audit.error_message = "Agent returned empty or invalid response"
+            _log_error_classified(
+                voice_trace_id, user_id, session_id,
+                VoiceErrorType.EMPTY_AGENT_RESPONSE,
+                "Agent returned empty or invalid response"
+            )
+            agent_response_en = "I processed your request but couldn't generate a response."
+            audit.fallback_used = True
+        
+        # Streaming-ready: Segment response for future Vapi TTS streaming
+        # This is internal only - final response remains unsegmented
+        first_sentence, remaining_text = _segment_response(agent_response_en)
+        _log_response_segments(user_id, session_id, first_sentence, remaining_text)
+        
+        # Step 3: Translate agent response back to source language if needed
+        if source_lang.lower() != "en":
+            final_response, translate_success, translate_out_ms = _safe_translate(
+                agent_response_en, target_lang=source_lang, fallback=agent_response_en
+            )
+            audit.was_translated_out = translate_success
+            audit.translate_out_latency_ms = translate_out_ms
+            
+            if not translate_success and not audit.error_type:
+                audit.error_type = VoiceErrorType.TRANSLATION_ERROR.value
+                audit.error_message = "Output translation failed"
+            
+            logger.info(
+                "voice.translate.output",
+                voice_trace_id=voice_trace_id,
+                user_id=user_id,
+                session_id=session_id,
+                source_lang="en",
+                target_lang=source_lang,
+                success=translate_success,
+                elapsed_ms=round(translate_out_ms, 2)
+            )
+        else:
+            final_response = agent_response_en
+        
+        # Calculate total latency
+        total_ms = (time.monotonic() - total_start) * 1000
+        audit.total_latency_ms = total_ms
+        
+        # Log if total processing was long-running
+        if total_ms > LONG_RUNNING_THRESHOLD_MS:
+            audit.long_running = True
+            logger.warning(
+                "voice.process.long_running",
+                voice_trace_id=voice_trace_id,
+                user_id=user_id,
+                session_id=session_id,
+                latency_total_ms=round(total_ms, 2),
+                threshold_ms=LONG_RUNNING_THRESHOLD_MS
+            )
+        
+        # Mark success if no errors occurred
+        if not audit.error_type:
+            audit.success = True
+        
+        logger.info(
+            "voice.process.success",
+            voice_trace_id=voice_trace_id,
+            user_id=user_id,
+            session_id=session_id,
+            source_lang=source_lang,
+            response_length=len(final_response),
+            latency_translate_in_ms=round(translate_in_ms, 2),
+            latency_agent_ms=round(agent_ms, 2),
+            latency_translate_out_ms=round(translate_out_ms, 2),
+            latency_total_ms=round(total_ms, 2)
+        )
+        
+        # Log consolidated audit summary
+        _log_audit_summary(audit)
+        
+        return {
+            "final_text": final_response,
+            "agent_text_en": agent_response_en
+        }
+        
+    except asyncio.TimeoutError as e:
+        # Specific handling for timeouts
+        total_ms = (time.monotonic() - total_start) * 1000
+        audit.total_latency_ms = total_ms
+        audit.error_type = VoiceErrorType.TIMEOUT.value
+        audit.error_message = str(e) or "Operation timed out"
+        audit.fallback_used = True
+        
+        _log_error_classified(
+            voice_trace_id, user_id, session_id,
+            VoiceErrorType.TIMEOUT,
+            str(e) or "Operation timed out"
+        )
+        
+        logger.error(
+            "voice.process.timeout",
+            voice_trace_id=voice_trace_id,
+            user_id=user_id,
+            session_id=session_id,
+            source_lang=source_lang,
+            error=str(e),
+            latency_total_ms=round(total_ms, 2)
+        )
+        
+        fallback_en = "I'm taking longer than expected. Please try again."
+        
+        # Best-effort translation for fallback
+        if source_lang.lower() != "en":
+            fallback_translated, _, _ = _safe_translate(
+                fallback_en, target_lang=source_lang, fallback=fallback_en
+            )
+        else:
+            fallback_translated = fallback_en
+        
+        # Log consolidated audit summary
+        _log_audit_summary(audit)
+        
+        return {
+            "final_text": fallback_translated,
+            "agent_text_en": fallback_en
+        }
+        
+    except Exception as e:
+        # Generic error handling - classify as agent_error or unknown
+        total_ms = (time.monotonic() - total_start) * 1000
+        audit.total_latency_ms = total_ms
+        audit.fallback_used = True
+        
+        # Classify error type
+        error_type = VoiceErrorType.UNKNOWN
+        if audit.agent_invoked and "agent" in str(e).lower():
+            error_type = VoiceErrorType.AGENT_ERROR
+        elif "translat" in str(e).lower():
+            error_type = VoiceErrorType.TRANSLATION_ERROR
+        
+        audit.error_type = error_type.value
+        audit.error_message = str(e)[:200] if str(e) else "Unknown error"
+        
+        _log_error_classified(
+            voice_trace_id, user_id, session_id,
+            error_type,
+            str(e)[:200] if str(e) else "Unknown error"
+        )
+        
+        logger.error(
+            "voice.process.error",
+            voice_trace_id=voice_trace_id,
+            user_id=user_id,
+            session_id=session_id,
+            source_lang=source_lang,
+            error=str(e),
+            error_type=type(e).__name__,
+            latency_total_ms=round(total_ms, 2)
+        )
+        
+        # Return safe fallback response - NEVER raise
+        fallback_en = "I apologize, but I encountered an error processing your request. Please try again."
+        
+        # Best-effort translation for fallback
+        if source_lang.lower() != "en":
+            fallback_translated, _, _ = _safe_translate(
+                fallback_en, target_lang=source_lang, fallback=fallback_en
+            )
+        else:
+            fallback_translated = fallback_en
+        
+        # Log consolidated audit summary
+        _log_audit_summary(audit)
+        
+        return {
+            "final_text": fallback_translated,
+            "agent_text_en": fallback_en
+        }
+
+
+# =============================================================================
+# Existing VoiceOrchestrator Code
+# =============================================================================
 
 
 class VoiceEventType(Enum):

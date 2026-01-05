@@ -191,7 +191,7 @@ def setup_exception_handlers(app: FastAPI) -> None:
                 error="HTTPException",
                 message=exc.detail,
                 timestamp=datetime.now(timezone.utc)
-            ).dict()
+            ).model_dump(mode='json')
         )
     
     @app.exception_handler(RequestValidationError)
@@ -209,7 +209,7 @@ def setup_exception_handlers(app: FastAPI) -> None:
                 message="Request validation failed",
                 details={"validation_errors": exc.errors()},
                 timestamp=datetime.now(timezone.utc)
-            ).dict()
+            ).model_dump(mode='json')
         )
     
     @app.exception_handler(StarletteHTTPException)
@@ -227,7 +227,7 @@ def setup_exception_handlers(app: FastAPI) -> None:
                 error="StarletteHTTPException",
                 message=exc.detail or "Internal server error",
                 timestamp=datetime.now(timezone.utc)
-            ).dict()
+            ).model_dump(mode='json')
         )
     
     @app.exception_handler(Exception)
@@ -246,7 +246,7 @@ def setup_exception_handlers(app: FastAPI) -> None:
                 message="An unexpected error occurred",
                 details={"error_type": type(exc).__name__} if settings.debug else None,
                 timestamp=datetime.now(timezone.utc)
-            ).dict()
+            ).model_dump(mode='json')
         )
 
 

@@ -35,6 +35,9 @@ RUN pip install --no-cache-dir \
 # Copy application code
 COPY src/ ./src/
 
+# Set Python path to include src directory
+ENV PYTHONPATH=/app/src
+
 # Expose port
 EXPOSE 10000
 

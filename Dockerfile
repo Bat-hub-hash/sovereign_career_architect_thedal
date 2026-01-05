@@ -30,7 +30,23 @@ RUN pip install --no-cache-dir \
     openai \
     rich \
     typer \
-    requests
+    requests \
+    playwright \
+    selenium \
+    websockets \
+    qdrant-client \
+    mem0ai \
+    chromadb \
+    pandas \
+    numpy \
+    beautifulsoup4 \
+    lxml \
+    pytest \
+    pytest-asyncio \
+    hypothesis
+
+# Install Playwright browsers (headless only to save space)
+RUN playwright install --with-deps chromium
 
 # Copy application code
 COPY src/ ./src/
